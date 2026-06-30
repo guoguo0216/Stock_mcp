@@ -409,6 +409,105 @@ async function fetchCapexCashflow(code, count = 8) {
   }));
 }
 
+// ---------- 巨潮资讯/深交所互动易：根据股票代码查询 orgId（互动易接口的必要参数，与公告orgId是不同的体系） ----------
+async function fetchIrmOrgId(code) {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+  const url = 'https://irm.cninfo.com.cn/newircs/index/queryKeyboardInfo';
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  const resp = await fetch(`${url}?${params.toString()}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://irm.cninfo.com.cn/',
+    },
+    body: `keyWord=${pureCode}`,
+  });
+  const data = await resp.json();
+  const list = data?.data || [];
+  const match = list.find((item) => item.code === pureCode) || list[0];
+  if (!match) throw new Error(`未找到股票代码 ${pureCode} 对应的互动易组织代码(orgId)`);
+  return match.secid;
+}
+
+// ---------- 深交所互动易：投资者问答（问董秘） ----------
+async function fetchInvestorQA(code, count = 30, keyword = '') {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+  const orgId = await fetchIrmOrgId(code);
+
+  const url = 'https://irm.cninfo.com.cn/newircs/company/question';
+  const params = new URLSearchParams({
+    _t: String(Date.now()),
+    stockcode: pureCode,
+    orgId,
+    pageSize: String(count),
+    pageNum: '1',
+    keyWord: keyword,
+    startDay: '',
+    endDay: '',
+  });
+  const resp = await fetch(`${url}?${params.toString()}`, {
+    method: 'POST',
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://irm.cninfo.com.cn/',
+    },
+  });
+  const data = await resp.json();
+  const rows = data?.rows || [];
+
+  return rows.map((row) => ({
+    questionId: row.indexId,
+    question: row.mainContent,
+    questionTime: row.pubDate ? row.pubDate.slice(0, 10) : null,
+    asker: row.authorName || null,
+    answer: row.attachedContent || null,
+    answerer: row.attachedAuthor || null,
+    companyName: row.companyShortName,
+  }));
+}
+
+// ---------- 东方财富：机构调研活动详细（单只股票） ----------
+async function fetchInstitutionSurvey(code, startDate, count = 30) {
+  const secuCode = toSecuCode(code);
+  const pureCode = secuCode.split('.')[0];
+
+  const url = 'https://datacenter-web.eastmoney.com/api/data/v1/get';
+  const params = new URLSearchParams({
+    sortColumns: 'NOTICE_DATE,RECEIVE_START_DATE',
+    sortTypes: '-1,-1',
+    pageSize: String(count),
+    pageNumber: '1',
+    reportName: 'RPT_ORG_SURVEY',
+    columns: 'SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,NOTICE_DATE,RECEIVE_START_DATE,' +
+      'RECEIVE_OBJECT,RECEIVE_PLACE,RECEIVE_WAY_EXPLAIN,INVESTIGATORS,RECEPTIONIST,ORG_TYPE',
+    source: 'WEB',
+    client: 'WEB',
+    filter: `(SECURITY_CODE="${pureCode}")(RECEIVE_START_DATE>='${startDate}')`,
+  });
+  const resp = await fetch(`${url}?${params.toString()}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://data.eastmoney.com/',
+    },
+  });
+  const data = await resp.json();
+  const rows = data?.result?.data || [];
+
+  return rows.map((row) => ({
+    noticeDate: row.NOTICE_DATE ? row.NOTICE_DATE.slice(0, 10) : null,
+    surveyDate: row.RECEIVE_START_DATE ? row.RECEIVE_START_DATE.slice(0, 10) : null,
+    participants: row.RECEIVE_OBJECT || null,
+    orgType: row.ORG_TYPE || null,
+    receivePlace: row.RECEIVE_PLACE || null,
+    receiveWay: row.RECEIVE_WAY_EXPLAIN || null,
+    investigators: row.INVESTIGATORS || null,
+    receptionist: row.RECEPTIONIST || null,
+  }));
+}
+
 // ---------- 根据公告标题推断分类（announcementTypeName字段在巨潮接口里经常为null，不可靠） ----------
 function inferAnnouncementType(title) {
   const rules = [
@@ -627,13 +726,27 @@ const TOOLS = [
     },
   },
   {
-    name: 'get_deducted_net_profit',
-    description: '获取单只A股股票的扣除非经常性损益后净利润（扣非净利润）季度序列，同时返回归母净利润、营业总收入、营业利润对照。扣非净利润剔除了一次性损益（如政府补贴、资产处置收益），比归母净利润更能反映主营业务真实盈利能力，是判断Serenity方法论第三步财务拐点是否为"真拐点"而非一次性损益伪装的关键交叉验证指标。',
+    name: 'get_investor_qa',
+    description: '获取单只A股股票在深交所"互动易"平台的投资者问答记录（问董秘），包括投资者提问内容、提问时间、公司回答内容、回答时间。这是了解管理层对经营细节、行业景气度、订单情况等问题真实表态的渠道，可用于辅助第三步财务拐点和第四步红队测试的定性验证。',
     inputSchema: {
       type: 'object',
       properties: {
         code: { type: 'string', description: '股票代码，支持纯数字或带前缀' },
-        count: { type: 'integer', description: '获取最近几期数据，默认8期' },
+        count: { type: 'integer', description: '获取最近几条问答，默认30条' },
+        keyword: { type: 'string', description: '按问题内容关键词筛选，可选（如"订单"、"产能"、"客户"）' },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'get_institution_survey',
+    description: '获取单只A股股票的机构调研活动详细记录，包括调研日期、参与调研的机构名单及类型、接待方式（现场/电话会议/线上交流）、公司接待人员。机构调研频次的异常上升、参与机构的质地，是市场关注度变化的早期领先信号，对应Serenity方法论"在市场普遍关注之前发现信号"的核心诉求，也可作为第二步候选池筛选和第五步熔断机制的辅助验证。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: '股票代码，支持纯数字或带前缀' },
+        start_date: { type: 'string', description: '起始日期，格式 YYYY-MM-DD，默认取近6个月' },
+        count: { type: 'integer', description: '获取最近几条调研记录，默认30条' },
       },
       required: ['code'],
     },
@@ -680,8 +793,13 @@ async function handleMcpRequest(body) {
         resultData = await fetchConstructionInProgress(args.code, args.count || 8);
       } else if (name === 'get_capex_cashflow') {
         resultData = await fetchCapexCashflow(args.code, args.count || 8);
-      } else if (name === 'get_deducted_net_profit') {
-        resultData = await fetchDeductedNetProfit(args.code, args.count || 8);
+      } else if (name === 'get_investor_qa') {
+        resultData = await fetchInvestorQA(args.code, args.count || 30, args.keyword || '');
+      } else if (name === 'get_institution_survey') {
+        const defaultStart = new Date();
+        defaultStart.setMonth(defaultStart.getMonth() - 6);
+        const startDate = args.start_date || defaultStart.toISOString().slice(0, 10);
+        resultData = await fetchInstitutionSurvey(args.code, startDate, args.count || 30);
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -866,6 +984,41 @@ export default {
       }
     }
 
+    if (url.pathname === '/investorqa' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const count = parseInt(url.searchParams.get('count') || '30', 10);
+      const keyword = url.searchParams.get('keyword') || '';
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346  (互动易投资者问答)' }, 400);
+      }
+      try {
+        const data = await fetchInvestorQA(code, count, keyword);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
+    if (url.pathname === '/survey' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const count = parseInt(url.searchParams.get('count') || '30', 10);
+      let startDate = url.searchParams.get('start');
+      if (!startDate) {
+        const d = new Date();
+        d.setMonth(d.getMonth() - 6);
+        startDate = d.toISOString().slice(0, 10);
+      }
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346&start=2026-01-01  (机构调研活动详细)' }, 400);
+      }
+      try {
+        const data = await fetchInstitutionSurvey(code, startDate, count);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
     // MCP 协议接口：POST /mcp
     if (url.pathname === '/mcp' && request.method === 'POST') {
       try {
@@ -891,6 +1044,8 @@ export default {
           shareholders: 'GET /shareholders?code=300346&date=2026-03-31  (调试用：十大流通股东)',
           capex: 'GET /capex?code=300346  (调试用：标准CapEx现金流科目，含rawSample原始字段)',
           deductedprofit: 'GET /deductedprofit?code=300346  (调试用：扣非净利润，含allItemTitles核对科目名)',
+          investorqa: 'GET /investorqa?code=300346  (调试用：互动易投资者问答)',
+          survey: 'GET /survey?code=300346&start=2026-01-01  (调试用：机构调研活动详细)',
           cip: 'GET /cip?code=300346  (调试用：在建工程趋势，含rawSample原始字段)',
         },
       });
