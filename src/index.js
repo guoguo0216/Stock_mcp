@@ -201,6 +201,80 @@ function exchangeToColumn(normalizedCode) {
   return 'szse';
 }
 
+// ---------- 东方财富：十大流通股东 ----------
+async function fetchTopShareholders(code, date = null) {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+  const exchangePrefix = normalized.slice(0, 2).toUpperCase(); // SH / SZ / BJ
+  const symbol = `${exchangePrefix}${pureCode}`;
+
+  let targetDate = date;
+  if (!targetDate) {
+    // 未指定日期，使用最近的报告期（粗略推算）
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = now.getMonth() + 1; // 1-12
+    if (m <= 3) targetDate = `${y - 1}-09-30`;
+    else if (m <= 6) targetDate = `${y - 1}-12-31`;
+    else if (m <= 9) targetDate = `${y}-03-31`;
+    else targetDate = `${y}-06-30`;
+  }
+
+  const url = 'https://emweb.securities.eastmoney.com/PC_HSF10/ShareholderResearch/PageSDLTGD';
+  const params = new URLSearchParams({ code: symbol, date: targetDate });
+  const resp = await fetch(`${url}?${params.toString()}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+  });
+  const data = await resp.json();
+  const list = data?.sdltgd || [];
+
+  return {
+    code: pureCode,
+    reportDate: targetDate,
+    shareholders: list.map((row, idx) => ({
+      rank: idx + 1,
+      holderName: row.HOLDER_NAME || row[5] || null,
+      holderType: row.HOLDER_TYPE || row[6] || null,
+      shareType: row.SHARES_TYPE || row[7] || null,
+      holdNum: row.HOLD_NUM != null ? Number(row.HOLD_NUM) : (row[8] != null ? Number(row[8]) : null),
+      holdRatio: row.FREE_HOLDNUM_RATIO != null ? Number(row.FREE_HOLDNUM_RATIO) : (row[9] != null ? Number(row[9]) : null),
+      changeType: row.IS_HOLDNUM_CHANGE || row[10] || null,
+      changeRatio: row.HOLDNUM_CHANGE_RATIO != null ? Number(row.HOLDNUM_CHANGE_RATIO) : (row[11] != null ? Number(row[11]) : null),
+    })),
+    rawSample: list.length > 0 ? list[0] : null, // 保留首条原始数据，便于核对字段是否解析正确
+  };
+}
+
+// ---------- 东方财富：主要财务指标（含资本性支出相关字段，用于CapEx趋势分析） ----------
+async function fetchCapexIndicators(code, count = 8, debug = false) {
+  const secuCode = toSecuCode(code);
+  const url = `https://datacenter.eastmoney.com/securities/api/data/get?` +
+    `type=RPT_F10_FINANCE_MAINFINADATA&sty=APP_F10_MAINFINADATA` +
+    `&quoteColumns=&filter=(SECUCODE="${secuCode}")` +
+    `&p=1&ps=${count}&sr=-1&st=REPORT_DATE&source=HSF10&client=PC`;
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://data.eastmoney.com/',
+    },
+  });
+  const data = await resp.json();
+  const rows = data?.result?.data || [];
+
+  if (debug) {
+    return rows.length > 0 ? rows[0] : { error: '无数据返回', raw: data };
+  }
+
+  return rows.map((row) => ({
+    reportDate: row.REPORT_DATE ? row.REPORT_DATE.slice(0, 10) : null,
+    operatingCashFlow: row.NETCASH_OPERATE ?? null,
+    investingCashFlow: row.NETCASH_INVEST ?? null,
+    capexProxy: row.FIXED_ASSET ?? row.TOTAL_FIXED_ASSET ?? null,
+    debtRatio: row.DEBT_ASSET_RATIO ?? null,
+    currentRatio: row.CURRENT_RATIO ?? null,
+  }));
+}
+
 // ---------- 根据公告标题推断分类（announcementTypeName字段在巨潮接口里经常为null，不可靠） ----------
 function inferAnnouncementType(title) {
   const rules = [
@@ -376,6 +450,42 @@ const TOOLS = [
       required: ['code', 'start_date', 'end_date'],
     },
   },
+  {
+    name: 'get_top_shareholders',
+    description: '获取单只A股股票最新报告期的十大流通股东名单，包括股东名称、类型、持股数量、占流通股比例、较上期持股变动情况。用于分析大客户/机构集中度、判断股东结构变化信号，对应Serenity方法论第四步"大客户自研/集中度"风险评估。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: '股票代码，支持纯数字或带前缀',
+        },
+        date: {
+          type: 'string',
+          description: '报告期日期，格式 YYYY-MM-DD（如"2026-03-31"），可选，不填则自动取最近报告期',
+        },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'get_capex_indicators',
+    description: '获取单只A股股票的主要财务指标季度序列，包括经营活动现金流净额、投资活动现金流净额、资产负债率、流动比率等，用于辅助判断CapEx（资本支出）趋势和现金流健康度，对应Serenity方法论第三步"CapEx爬坡信号"。注意：此接口字段尚在验证阶段，建议交叉核对其他数据源。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: '股票代码，支持纯数字或带前缀',
+        },
+        count: {
+          type: 'integer',
+          description: '获取最近几期数据，默认8期',
+        },
+      },
+      required: ['code'],
+    },
+  },
 ];
 
 // ---------- MCP 协议处理 ----------
@@ -412,6 +522,10 @@ async function handleMcpRequest(body) {
         resultData = await fetchValuationMetrics(args.code);
       } else if (name === 'get_announcements') {
         resultData = await fetchAnnouncements(args.code, args.start_date, args.end_date, args.keyword || '');
+      } else if (name === 'get_top_shareholders') {
+        resultData = await fetchTopShareholders(args.code, args.date || null);
+      } else if (name === 'get_capex_indicators') {
+        resultData = await fetchCapexIndicators(args.code, args.count || 8);
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -540,6 +654,35 @@ export default {
       }
     }
 
+    if (url.pathname === '/shareholders' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const date = url.searchParams.get('date');
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346（可选 &date=2026-03-31）' }, 400);
+      }
+      try {
+        const data = await fetchTopShareholders(code, date);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
+    if (url.pathname === '/capex' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const count = parseInt(url.searchParams.get('count') || '8', 10);
+      const debug = url.searchParams.get('debug') === '1';
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346（加 &debug=1 查看原始字段）' }, 400);
+      }
+      try {
+        const data = await fetchCapexIndicators(code, count, debug);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
     // MCP 协议接口：POST /mcp
     if (url.pathname === '/mcp' && request.method === 'POST') {
       try {
@@ -562,6 +705,8 @@ export default {
           valuation: 'GET /valuation?code=300346  (调试用：估值指标PE/PB/市值)',
           announcements: 'GET /announcements?code=300346&start=2026-01-01&end=2026-06-30  (调试用：公告列表)',
           orgid: 'GET /orgid?code=300346  (调试用：查询巨潮资讯orgId)',
+          shareholders: 'GET /shareholders?code=300346&date=2026-03-31  (调试用：十大流通股东)',
+          capex: 'GET /capex?code=300346&debug=1  (调试用：CapEx相关财务指标，建议先用debug=1核对字段)',
         },
       });
     }
