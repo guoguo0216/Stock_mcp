@@ -86,6 +86,80 @@ async function fetchTencentHistory(code, startDate, endDate) {
   }));
 }
 
+// ---------- 东方财富：股票代码 -> SECUCODE 格式转换 ----------
+// 东方财富财务数据接口要求 SECUCODE 格式：代码.SH / 代码.SZ / 代码.BJ
+function toSecuCode(code) {
+  const normalized = normalizeCode(code); // 如 sz300346
+  const pure = normalized.slice(2);
+  const exchangeMap = { sz: 'SZ', sh: 'SH', bj: 'BJ' };
+  const exchange = exchangeMap[normalized.slice(0, 2)];
+  return `${pure}.${exchange}`;
+}
+
+// ---------- 东方财富：核心财务指标（业绩报表，含毛利率/营收/净利润/ROE） ----------
+async function fetchFinancialIndicators(code, count = 8) {
+  const secuCode = toSecuCode(code);
+  const url = `https://datacenter-web.eastmoney.com/api/data/v1/get?` +
+    `sortColumns=REPORTDATE&sortTypes=-1&pageSize=${count}&pageNumber=1` +
+    `&reportName=RPT_LICO_FN_CPD&columns=ALL` +
+    `&filter=(SECUCODE="${secuCode}")`;
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://data.eastmoney.com/',
+    },
+  });
+  const data = await resp.json();
+  const rows = data?.result?.data || [];
+
+  return rows.map((row) => ({
+    reportDate: row.REPORTDATE ? row.REPORTDATE.slice(0, 10) : null,    // 报告期
+    reportType: row.DATATYPE,                                           // 如"2026年 一季报"
+    revenue: row.TOTAL_OPERATE_INCOME,                                  // 营业总收入（元）
+    revenueYoY: row.YSTZ,                                                // 营收同比%
+    revenueQoQ: row.YSHZ,                                                // 营收环比%
+    netProfit: row.PARENT_NETPROFIT,                                    // 归母净利润（元）
+    netProfitYoY: row.SJLTZ,                                             // 净利润同比%
+    netProfitQoQ: row.SJLHZ,                                             // 净利润环比%
+    grossMargin: row.XSMLL,                                              // 销售毛利率%（核心：Serenity第三步毛利率拐点）
+    roeWeighted: row.WEIGHTAVG_ROE,                                      // 加权净资产收益率%
+    eps: row.BASIC_EPS,                                                  // 基本每股收益
+    bps: row.BPS,                                                        // 每股净资产
+    operatingCashFlowPerShare: row.MGJYXJJE,                             // 每股经营性现金流
+    industry: row.PUBLISHNAME,                                           // 所属行业
+    noticeDate: row.NOTICE_DATE ? row.NOTICE_DATE.slice(0, 10) : null,   // 公告日期
+  }));
+}
+
+// ---------- 东方财富：估值指标（PE/PB/市值，用于核对行情接口数据） ----------
+async function fetchValuationMetrics(code) {
+  const secuCode = toSecuCode(code);
+  const url = `https://datacenter-web.eastmoney.com/api/data/v1/get?` +
+    `sortColumns=TRADE_DATE&sortTypes=-1&pageSize=1&pageNumber=1` +
+    `&reportName=RPT_VALUEANALYSIS_DET&columns=ALL` +
+    `&filter=(SECUCODE="${secuCode}")`;
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'https://data.eastmoney.com/',
+    },
+  });
+  const data = await resp.json();
+  const rows = data?.result?.data || [];
+  if (rows.length === 0) return null;
+  const row = rows[0];
+
+  return {
+    tradeDate: row.TRADE_DATE ? row.TRADE_DATE.slice(0, 10) : null,
+    closePrice: row.CLOSE_PRICE,
+    peTTM: row.PE_TTM,           // 市盈率(TTM)
+    peStatic: row.PE_LAR,         // 市盈率(静态)
+    pb: row.PBMRQ,                 // 市净率(MRQ)
+    totalMarketCap: row.TOTAL_MARKET_CAP,         // 总市值
+    circulatingMarketCap: row.FREE_CAP,            // 流通市值
+  };
+}
+
 // ---------- MCP 工具定义 ----------
 const TOOLS = [
   {
@@ -125,6 +199,38 @@ const TOOLS = [
       required: ['code', 'start_date', 'end_date'],
     },
   },
+  {
+    name: 'get_financial_indicators',
+    description: '获取单只A股股票的核心财务指标历史数据（季度序列），包括营业收入、归母净利润、销售毛利率、加权ROE、营收/利润同比环比增速、每股经营现金流等。用于分析毛利率拐点、营收利润趋势。数据来源为上市公司定期财报。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: '股票代码，支持纯数字（如"300346"）或带前缀（如"sz300346"）',
+        },
+        count: {
+          type: 'integer',
+          description: '获取最近几期数据，默认8期（约2年的季度数据）',
+        },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'get_valuation_metrics',
+    description: '获取单只A股股票最新的估值指标，包括市盈率(TTM/静态)、市净率、总市值、流通市值。用于核对实时行情接口的市值数据，或快速判断估值水平。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: '股票代码，支持纯数字或带前缀',
+        },
+      },
+      required: ['code'],
+    },
+  },
 ];
 
 // ---------- MCP 协议处理 ----------
@@ -155,6 +261,10 @@ async function handleMcpRequest(body) {
         resultData = await fetchSinaRealtime(args.codes);
       } else if (name === 'get_history_kline') {
         resultData = await fetchTencentHistory(args.code, args.start_date, args.end_date);
+      } else if (name === 'get_financial_indicators') {
+        resultData = await fetchFinancialIndicators(args.code, args.count || 8);
+      } else if (name === 'get_valuation_metrics') {
+        resultData = await fetchValuationMetrics(args.code);
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -226,6 +336,33 @@ export default {
       }
     }
 
+    if (url.pathname === '/financials' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const count = parseInt(url.searchParams.get('count') || '8', 10);
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346&count=8' }, 400);
+      }
+      try {
+        const data = await fetchFinancialIndicators(code, count);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (url.pathname === '/valuation' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346' }, 400);
+      }
+      try {
+        const data = await fetchValuationMetrics(code);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
     // MCP 协议接口：POST /mcp
     if (url.pathname === '/mcp' && request.method === 'POST') {
       try {
@@ -242,8 +379,10 @@ export default {
         name: 'A股行情 MCP Server',
         endpoints: {
           mcp: 'POST /mcp  (MCP协议接口，供Claude连接)',
-          quote: 'GET /quote?codes=300346,002428  (调试用)',
-          history: 'GET /history?code=300346&start=2026-06-01&end=2026-06-29  (调试用)',
+          quote: 'GET /quote?codes=300346,002428  (调试用：实时行情)',
+          history: 'GET /history?code=300346&start=2026-06-01&end=2026-06-29  (调试用：历史K线)',
+          financials: 'GET /financials?code=300346&count=8  (调试用：财务指标季度序列)',
+          valuation: 'GET /valuation?code=300346  (调试用：估值指标PE/PB/市值)',
         },
       });
     }
