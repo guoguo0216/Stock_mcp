@@ -132,7 +132,7 @@ async function fetchFinancialIndicators(code, count = 8) {
 }
 
 // ---------- 东方财富：估值指标（PE/PB/市值，用于核对行情接口数据） ----------
-async function fetchValuationMetrics(code) {
+async function fetchValuationMetrics(code, debug = false) {
   const secuCode = toSecuCode(code);
   const url = `https://datacenter-web.eastmoney.com/api/data/v1/get?` +
     `sortColumns=TRADE_DATE&sortTypes=-1&pageSize=1&pageNumber=1` +
@@ -149,6 +149,11 @@ async function fetchValuationMetrics(code) {
   if (rows.length === 0) return null;
   const row = rows[0];
 
+  if (debug) {
+    // 调试模式：返回原始全部字段，用于核对正确字段名
+    return row;
+  }
+
   return {
     tradeDate: row.TRADE_DATE ? row.TRADE_DATE.slice(0, 10) : null,
     closePrice: row.CLOSE_PRICE,
@@ -156,7 +161,7 @@ async function fetchValuationMetrics(code) {
     peStatic: row.PE_LAR,         // 市盈率(静态)
     pb: row.PBMRQ,                 // 市净率(MRQ)
     totalMarketCap: row.TOTAL_MARKET_CAP,         // 总市值
-    circulatingMarketCap: row.FREE_CAP,            // 流通市值
+    circulatingMarketCap: row.FREE_CAP ?? row.LIQUIDITY_MARKET_CAP ?? row.FREE_MARKET_CAP ?? row.CIRCULATING_MARKET_CAP ?? null,
   };
 }
 
@@ -352,11 +357,12 @@ export default {
 
     if (url.pathname === '/valuation' && request.method === 'GET') {
       const code = url.searchParams.get('code');
+      const debug = url.searchParams.get('debug') === '1';
       if (!code) {
-        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346' }, 400);
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346（加 &debug=1 查看原始字段）' }, 400);
       }
       try {
-        const data = await fetchValuationMetrics(code);
+        const data = await fetchValuationMetrics(code, debug);
         return jsonResponse(data);
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
