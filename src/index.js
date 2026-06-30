@@ -159,9 +159,13 @@ async function fetchValuationMetrics(code, debug = false) {
     closePrice: row.CLOSE_PRICE,
     peTTM: row.PE_TTM,           // 市盈率(TTM)
     peStatic: row.PE_LAR,         // 市盈率(静态)
-    pb: row.PBMRQ,                 // 市净率(MRQ)
-    totalMarketCap: row.TOTAL_MARKET_CAP,         // 总市值
-    circulatingMarketCap: row.FREE_CAP ?? row.LIQUIDITY_MARKET_CAP ?? row.FREE_MARKET_CAP ?? row.CIRCULATING_MARKET_CAP ?? null,
+    pb: row.PB_MRQ,                // 市净率(MRQ)
+    totalMarketCap: row.TOTAL_MARKET_CAP,                // 总市值
+    circulatingMarketCap: row.NOTLIMITED_MARKETCAP_A,    // 无限售流通市值（A股口径）
+    totalShares: row.TOTAL_SHARES,                        // 总股本
+    circulatingShares: row.FREE_SHARES_A,                 // 无限售流通股数
+    psTTM: row.PS_TTM,            // 市销率(TTM)
+    pcfOcfTTM: row.PCF_OCF_TTM,   // 市现率(经营现金流TTM)
   };
 }
 
