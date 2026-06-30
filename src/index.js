@@ -169,7 +169,85 @@ async function fetchValuationMetrics(code, debug = false) {
   };
 }
 
-// ---------- MCP 工具定义 ----------
+// ---------- 巨潮资讯：根据股票代码查询 orgId（公告接口的必要参数） ----------
+async function fetchCninfoOrgId(code) {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+  const url = 'http://www.cninfo.com.cn/new/information/topSearch/query';
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'http://www.cninfo.com.cn/',
+    },
+    body: `keyWord=${pureCode}`,
+  });
+  const data = await resp.json();
+  // 返回结果通常是数组，匹配股票代码精确对应的那一条
+  const list = Array.isArray(data) ? data : (data?.keyBoardList || []);
+  const match = list.find((item) => item.code === pureCode) || list[0];
+  if (!match) throw new Error(`未找到股票代码 ${pureCode} 对应的机构ID(orgId)`);
+  return { orgId: match.orgId, code: pureCode, name: match.zwjc };
+}
+
+// ---------- 巨潮资讯：公司公告列表 ----------
+function exchangeToColumn(normalizedCode) {
+  // 巨潮 column 参数：深市 szse，沪市 sse，北交所 bj
+  const prefix = normalizedCode.slice(0, 2);
+  if (prefix === 'sz') return 'szse';
+  if (prefix === 'sh') return 'sse';
+  if (prefix === 'bj') return 'bj';
+  return 'szse';
+}
+
+async function fetchAnnouncements(code, startDate, endDate, keyword = '', pageSize = 20) {
+  const normalized = normalizeCode(code);
+  const { orgId, code: pureCode, name } = await fetchCninfoOrgId(code);
+  const column = exchangeToColumn(normalized);
+
+  const url = 'http://www.cninfo.com.cn/new/hisAnnouncement/query';
+  const params = new URLSearchParams({
+    pageNum: '1',
+    pageSize: String(pageSize),
+    column,
+    tabName: 'fulltext',
+    stock: `${pureCode},${orgId}`,
+    searchkey: keyword,
+    category: '',
+    seDate: `${startDate}~${endDate}`,
+    sortName: '',
+    sortType: '',
+    isHLtitle: 'true',
+  });
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'User-Agent': 'Mozilla/5.0',
+      'Referer': 'http://www.cninfo.com.cn/',
+    },
+    body: params.toString(),
+  });
+  const data = await resp.json();
+  const list = data?.announcements || [];
+
+  return {
+    company: name,
+    code: pureCode,
+    totalCount: data?.totalAnnouncement || list.length,
+    announcements: list.map((item) => ({
+      title: (item.announcementTitle || '').replace(/<\/?em>/g, ''), // 去除高亮标签
+      time: item.announcementTime ? new Date(item.announcementTime).toISOString().slice(0, 10) : null,
+      type: item.announcementTypeName || null,
+      pdfUrl: item.adjunctUrl ? `http://static.cninfo.com.cn/${item.adjunctUrl}` : null,
+      sizeKB: item.adjunctSize || null,
+    })),
+  };
+}
+
+
 const TOOLS = [
   {
     name: 'get_realtime_quote',
@@ -240,6 +318,32 @@ const TOOLS = [
       required: ['code'],
     },
   },
+  {
+    name: 'get_announcements',
+    description: '获取单只A股股票指定日期范围内的公司公告列表，包括公告标题、日期、类型、PDF链接。用于追踪重大事项、业绩预告、股东大会、解禁公告、监管问询等信息披露，是Serenity方法论第四步红队测试和第五步熔断机制验证的关键数据源。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: '股票代码，支持纯数字或带前缀',
+        },
+        start_date: {
+          type: 'string',
+          description: '起始日期，格式 YYYY-MM-DD',
+        },
+        end_date: {
+          type: 'string',
+          description: '结束日期，格式 YYYY-MM-DD',
+        },
+        keyword: {
+          type: 'string',
+          description: '公告标题关键词筛选，可选（如"业绩预告"、"股东大会"）',
+        },
+      },
+      required: ['code', 'start_date', 'end_date'],
+    },
+  },
 ];
 
 // ---------- MCP 协议处理 ----------
@@ -274,6 +378,8 @@ async function handleMcpRequest(body) {
         resultData = await fetchFinancialIndicators(args.code, args.count || 8);
       } else if (name === 'get_valuation_metrics') {
         resultData = await fetchValuationMetrics(args.code);
+      } else if (name === 'get_announcements') {
+        resultData = await fetchAnnouncements(args.code, args.start_date, args.end_date, args.keyword || '');
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -373,6 +479,35 @@ export default {
       }
     }
 
+    if (url.pathname === '/announcements' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const start = url.searchParams.get('start');
+      const end = url.searchParams.get('end');
+      const keyword = url.searchParams.get('keyword') || '';
+      if (!code || !start || !end) {
+        return jsonResponse({ error: '请提供 code, start, end 参数，如 ?code=300346&start=2026-01-01&end=2026-06-30' }, 400);
+      }
+      try {
+        const data = await fetchAnnouncements(code, start, end, keyword);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
+    if (url.pathname === '/orgid' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数（调试用，查orgId）' }, 400);
+      }
+      try {
+        const data = await fetchCninfoOrgId(code);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
     // MCP 协议接口：POST /mcp
     if (url.pathname === '/mcp' && request.method === 'POST') {
       try {
@@ -393,6 +528,8 @@ export default {
           history: 'GET /history?code=300346&start=2026-06-01&end=2026-06-29  (调试用：历史K线)',
           financials: 'GET /financials?code=300346&count=8  (调试用：财务指标季度序列)',
           valuation: 'GET /valuation?code=300346  (调试用：估值指标PE/PB/市值)',
+          announcements: 'GET /announcements?code=300346&start=2026-01-01&end=2026-06-30  (调试用：公告列表)',
+          orgid: 'GET /orgid?code=300346  (调试用：查询巨潮资讯orgId)',
         },
       });
     }
