@@ -201,6 +201,35 @@ function exchangeToColumn(normalizedCode) {
   return 'szse';
 }
 
+// ---------- 根据公告标题推断分类（announcementTypeName字段在巨潮接口里经常为null，不可靠） ----------
+function inferAnnouncementType(title) {
+  const rules = [
+    { keyword: ['年度报告', '年报'], type: '年报' },
+    { keyword: ['一季度报告', '一季报', '第一季度报告'], type: '一季报' },
+    { keyword: ['半年度报告', '半年报', '中期报告'], type: '半年报' },
+    { keyword: ['三季度报告', '三季报', '第三季度报告'], type: '三季报' },
+    { keyword: ['业绩预告', '业绩快报'], type: '业绩预告' },
+    { keyword: ['股东大会'], type: '股东大会' },
+    { keyword: ['减持计划', '减持股份', '减持进展'], type: '股东减持' },
+    { keyword: ['增持计划', '增持股份'], type: '股东增持' },
+    { keyword: ['权益变动', '权益分布'], type: '权益变动' },
+    { keyword: ['解除限售', '限售解禁', '解禁'], type: '限售解禁' },
+    { keyword: ['股权激励', '激励计划'], type: '股权激励' },
+    { keyword: ['董事', '监事', '高级管理人员'], type: '人事变动' },
+    { keyword: ['关联交易'], type: '关联交易' },
+    { keyword: ['对外投资', '投资公告', '募投项目'], type: '对外投资' },
+    { keyword: ['诉讼', '仲裁'], type: '诉讼仲裁' },
+    { keyword: ['问询函', '关注函', '监管函'], type: '监管问询' },
+    { keyword: ['独立董事述职'], type: '独立董事述职' },
+    { keyword: ['内部控制'], type: '内控报告' },
+    { keyword: ['风险提示'], type: '风险提示' },
+  ];
+  for (const rule of rules) {
+    if (rule.keyword.some((k) => title.includes(k))) return rule.type;
+  }
+  return '其他';
+}
+
 async function fetchAnnouncements(code, startDate, endDate, keyword = '', pageSize = 20) {
   const normalized = normalizeCode(code);
   const { orgId, code: pureCode, name } = await fetchCninfoOrgId(code);
@@ -237,13 +266,16 @@ async function fetchAnnouncements(code, startDate, endDate, keyword = '', pageSi
     company: name,
     code: pureCode,
     totalCount: data?.totalAnnouncement || list.length,
-    announcements: list.map((item) => ({
-      title: (item.announcementTitle || '').replace(/<\/?em>/g, ''), // 去除高亮标签
-      time: item.announcementTime ? new Date(item.announcementTime).toISOString().slice(0, 10) : null,
-      type: item.announcementTypeName || null,
-      pdfUrl: item.adjunctUrl ? `http://static.cninfo.com.cn/${item.adjunctUrl}` : null,
-      sizeKB: item.adjunctSize || null,
-    })),
+    announcements: list.map((item) => {
+      const title = (item.announcementTitle || '').replace(/<\/?em>/g, ''); // 去除高亮标签
+      return {
+        title,
+        time: item.announcementTime ? new Date(item.announcementTime).toISOString().slice(0, 10) : null,
+        type: item.announcementTypeName || inferAnnouncementType(title),
+        pdfUrl: item.adjunctUrl ? `http://static.cninfo.com.cn/${item.adjunctUrl}` : null,
+        sizeKB: item.adjunctSize || null,
+      };
+    }),
   };
 }
 
