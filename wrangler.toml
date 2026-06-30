@@ -1,0 +1,6 @@
+name = "a-share-stock-quote"
+main = "src/index.js"
+compatibility_date = "2026-06-30"
+
+[observability]
+enabled = true
