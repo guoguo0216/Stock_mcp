@@ -275,6 +275,59 @@ async function fetchCapexIndicators(code, count = 8, debug = false) {
   }));
 }
 
+// ---------- 新浪财经：利润表关键科目（含扣非净利润，按中文科目名匹配，不依赖猜测英文字段名） ----------
+async function fetchDeductedNetProfit(code, count = 8) {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+
+  const url = 'https://quotes.sina.cn/cn/api/openapi.php/CompanyFinanceService.getFinanceReport2022';
+  const params = new URLSearchParams({
+    paperCode: normalized, // sz300346 / sh600000 格式
+    source: 'lrb', // 利润表
+    type: '0', // 0=全部报告期
+    page: '1',
+    num: String(count),
+  });
+  const resp = await fetch(`${url}?${params.toString()}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+  });
+  const data = await resp.json();
+  const reportList = data?.result?.data?.report_list;
+  if (!reportList) return { error: '未获取到利润表数据', raw: data };
+
+  // 按报告期日期降序排列（key形如 "20260331"）
+  const reportDates = Object.keys(reportList).sort((a, b) => b.localeCompare(a)).slice(0, count);
+
+  // 中文科目名关键词匹配规则，避免依赖猜测的英文字段名
+  const matchRules = {
+    deductedNetProfit: ['扣除非经常性损益后的净利润', '扣非净利润', '扣除非经常性损益'],
+    netProfit: ['净利润', '归属于母公司所有者的净利润', '归属于上市公司股东的净利润'],
+    operatingRevenue: ['营业总收入', '营业收入'],
+    operatingProfit: ['营业利润'],
+  };
+
+  function findValue(items, keywords) {
+    for (const kw of keywords) {
+      const hit = items.find((it) => (it.item_title || '').includes(kw));
+      if (hit) return hit.item_value;
+    }
+    return null;
+  }
+
+  return reportDates.map((dateKey) => {
+    const items = reportList[dateKey]?.data || [];
+    return {
+      reportDate: `${dateKey.slice(0, 4)}-${dateKey.slice(4, 6)}-${dateKey.slice(6, 8)}`,
+      deductedNetProfit: findValue(items, matchRules.deductedNetProfit),
+      netProfit: findValue(items, matchRules.netProfit),
+      operatingRevenue: findValue(items, matchRules.operatingRevenue),
+      operatingProfit: findValue(items, matchRules.operatingProfit),
+      // 保留全部科目名称，便于核对是否有遗漏或更精确的匹配项
+      allItemTitles: items.map((it) => it.item_title),
+    };
+  });
+}
+
 // ---------- 东方财富：查询公司类型代码（资产负债表/现金流量表接口的必要前置参数） ----------
 async function fetchCompanyType(symbol) {
   const url = `https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/Index?type=web&code=${symbol.toLowerCase()}`;
@@ -573,6 +626,18 @@ const TOOLS = [
       required: ['code'],
     },
   },
+  {
+    name: 'get_deducted_net_profit',
+    description: '获取单只A股股票的扣除非经常性损益后净利润（扣非净利润）季度序列，同时返回归母净利润、营业总收入、营业利润对照。扣非净利润剔除了一次性损益（如政府补贴、资产处置收益），比归母净利润更能反映主营业务真实盈利能力，是判断Serenity方法论第三步财务拐点是否为"真拐点"而非一次性损益伪装的关键交叉验证指标。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: '股票代码，支持纯数字或带前缀' },
+        count: { type: 'integer', description: '获取最近几期数据，默认8期' },
+      },
+      required: ['code'],
+    },
+  },
 ];
 
 // ---------- MCP 协议处理 ----------
@@ -615,6 +680,8 @@ async function handleMcpRequest(body) {
         resultData = await fetchConstructionInProgress(args.code, args.count || 8);
       } else if (name === 'get_capex_cashflow') {
         resultData = await fetchCapexCashflow(args.code, args.count || 8);
+      } else if (name === 'get_deducted_net_profit') {
+        resultData = await fetchDeductedNetProfit(args.code, args.count || 8);
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -785,6 +852,20 @@ export default {
       }
     }
 
+    if (url.pathname === '/deductedprofit' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const count = parseInt(url.searchParams.get('count') || '8', 10);
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346  (扣非净利润，含allItemTitles用于核对科目名)' }, 400);
+      }
+      try {
+        const data = await fetchDeductedNetProfit(code, count);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
     // MCP 协议接口：POST /mcp
     if (url.pathname === '/mcp' && request.method === 'POST') {
       try {
@@ -809,6 +890,7 @@ export default {
           orgid: 'GET /orgid?code=300346  (调试用：查询巨潮资讯orgId)',
           shareholders: 'GET /shareholders?code=300346&date=2026-03-31  (调试用：十大流通股东)',
           capex: 'GET /capex?code=300346  (调试用：标准CapEx现金流科目，含rawSample原始字段)',
+          deductedprofit: 'GET /deductedprofit?code=300346  (调试用：扣非净利润，含allItemTitles核对科目名)',
           cip: 'GET /cip?code=300346  (调试用：在建工程趋势，含rawSample原始字段)',
         },
       });
