@@ -275,6 +275,87 @@ async function fetchCapexIndicators(code, count = 8, debug = false) {
   }));
 }
 
+// ---------- 东方财富：查询公司类型代码（资产负债表/现金流量表接口的必要前置参数） ----------
+async function fetchCompanyType(symbol) {
+  const url = `https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/Index?type=web&code=${symbol.toLowerCase()}`;
+  const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const html = await resp.text();
+  const m = html.match(/id=["']hidctype["']\s+value=["']([^"']+)["']/i)
+    || html.match(/<input[^>]*id=["']hidctype["'][^>]*value=["']([^"']+)["']/i);
+  if (!m) throw new Error('未能解析公司类型代码(companyType)，页面结构可能已变化');
+  return m[1];
+}
+
+// ---------- 东方财富：在建工程趋势（资产负债表，作为CapEx的早期代理信号） ----------
+async function fetchConstructionInProgress(code, count = 8) {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+  const exchangePrefix = normalized.slice(0, 2).toUpperCase();
+  const symbol = `${exchangePrefix}${pureCode}`;
+
+  const companyType = await fetchCompanyType(symbol);
+
+  const dateUrl = 'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbDateAjaxNew';
+  const dateResp = await fetch(`${dateUrl}?${new URLSearchParams({ companyType, reportDateType: '0', code: symbol })}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+  });
+  const dateData = await dateResp.json();
+  const allDates = (dateData?.data || []).map((d) => (d.REPORT_DATE || '').slice(0, 10)).filter(Boolean);
+  const dates = allDates.slice(0, count);
+  if (dates.length === 0) return [];
+
+  const url = 'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbAjaxNew';
+  const params = new URLSearchParams({
+    companyType, reportDateType: '0', reportType: '1', dates: dates.join(','), code: symbol,
+  });
+  const resp = await fetch(`${url}?${params.toString()}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const data = await resp.json();
+  const rows = data?.data || [];
+
+  return rows.map((row) => ({
+    reportDate: row.REPORT_DATE ? row.REPORT_DATE.slice(0, 10) : null,
+    constructionInProgress: row.CIP ?? row.CONSTRUCTION_MATERIALS ?? null,
+    fixedAssets: row.FIXED_ASSET ?? null,
+    totalAssets: row.TOTAL_ASSETS ?? null,
+    rawSample: row,
+  }));
+}
+
+// ---------- 东方财富：CapEx标准科目（现金流量表，购建固定资产/无形资产支付的现金） ----------
+async function fetchCapexCashflow(code, count = 8) {
+  const normalized = normalizeCode(code);
+  const pureCode = normalized.slice(2);
+  const exchangePrefix = normalized.slice(0, 2).toUpperCase();
+  const symbol = `${exchangePrefix}${pureCode}`;
+
+  const companyType = await fetchCompanyType(symbol);
+
+  const dateUrl = 'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/xjllbDateAjaxNew';
+  const dateResp = await fetch(`${dateUrl}?${new URLSearchParams({ companyType, reportDateType: '0', code: symbol })}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+  });
+  const dateData = await dateResp.json();
+  const allDates = (dateData?.data || []).map((d) => (d.REPORT_DATE || '').slice(0, 10)).filter(Boolean);
+  const dates = allDates.slice(0, count);
+  if (dates.length === 0) return [];
+
+  const url = 'https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/xjllbAjaxNew';
+  const params = new URLSearchParams({
+    companyType, reportDateType: '0', reportType: '1', dates: dates.join(','), code: symbol,
+  });
+  const resp = await fetch(`${url}?${params.toString()}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const data = await resp.json();
+  const rows = data?.data || [];
+
+  return rows.map((row) => ({
+    reportDate: row.REPORT_DATE ? row.REPORT_DATE.slice(0, 10) : null,
+    capexStandard: row.CONSTRUCT_LONG_ASSET ?? row.FIX_INTAN_OTHER_ASSET_ACQUI_CASH ?? null,
+    operatingCashFlowNet: row.NETCASH_OPERATE ?? null,
+    investingCashFlowNet: row.NETCASH_INVEST ?? null,
+    rawSample: row,
+  }));
+}
+
 // ---------- 根据公告标题推断分类（announcementTypeName字段在巨潮接口里经常为null，不可靠） ----------
 function inferAnnouncementType(title) {
   const rules = [
@@ -469,19 +550,25 @@ const TOOLS = [
     },
   },
   {
-    name: 'get_capex_indicators',
-    description: '获取单只A股股票的主要财务指标季度序列，包括经营活动现金流净额、投资活动现金流净额、资产负债率、流动比率等，用于辅助判断CapEx（资本支出）趋势和现金流健康度，对应Serenity方法论第三步"CapEx爬坡信号"。注意：此接口字段尚在验证阶段，建议交叉核对其他数据源。',
+    name: 'get_construction_in_progress',
+    description: '获取单只A股股票的在建工程余额季度序列（来自资产负债表）。在建工程是CapEx的早期领先信号，余额连续多季度上升通常意味着产能扩张正在进行中，比现金流量表里的实际CapEx支出更早反映投资动作。适合作为Serenity方法论第三步CapEx爬坡信号的初筛指标，尤其适用于重资产制造业。',
     inputSchema: {
       type: 'object',
       properties: {
-        code: {
-          type: 'string',
-          description: '股票代码，支持纯数字或带前缀',
-        },
-        count: {
-          type: 'integer',
-          description: '获取最近几期数据，默认8期',
-        },
+        code: { type: 'string', description: '股票代码，支持纯数字或带前缀' },
+        count: { type: 'integer', description: '获取最近几期数据，默认8期' },
+      },
+      required: ['code'],
+    },
+  },
+  {
+    name: 'get_capex_cashflow',
+    description: '获取单只A股股票的标准CapEx科目季度序列（来自现金流量表"购建固定资产、无形资产和其他长期资产支付的现金"），同时附带经营/投资活动现金流净额。这是CapEx的官方会计口径，全市场可比，适合作为在建工程初筛信号之后的精确复核指标，对应Serenity方法论第三步CapEx爬坡信号的确认环节。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: '股票代码，支持纯数字或带前缀' },
+        count: { type: 'integer', description: '获取最近几期数据，默认8期' },
       },
       required: ['code'],
     },
@@ -524,8 +611,10 @@ async function handleMcpRequest(body) {
         resultData = await fetchAnnouncements(args.code, args.start_date, args.end_date, args.keyword || '');
       } else if (name === 'get_top_shareholders') {
         resultData = await fetchTopShareholders(args.code, args.date || null);
-      } else if (name === 'get_capex_indicators') {
-        resultData = await fetchCapexIndicators(args.code, args.count || 8);
+      } else if (name === 'get_construction_in_progress') {
+        resultData = await fetchConstructionInProgress(args.code, args.count || 8);
+      } else if (name === 'get_capex_cashflow') {
+        resultData = await fetchCapexCashflow(args.code, args.count || 8);
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -668,15 +757,28 @@ export default {
       }
     }
 
+    if (url.pathname === '/cip' && request.method === 'GET') {
+      const code = url.searchParams.get('code');
+      const count = parseInt(url.searchParams.get('count') || '8', 10);
+      if (!code) {
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346  (在建工程趋势)' }, 400);
+      }
+      try {
+        const data = await fetchConstructionInProgress(code, count);
+        return jsonResponse(data);
+      } catch (err) {
+        return jsonResponse({ error: err.message, stack: err.stack }, 500);
+      }
+    }
+
     if (url.pathname === '/capex' && request.method === 'GET') {
       const code = url.searchParams.get('code');
       const count = parseInt(url.searchParams.get('count') || '8', 10);
-      const debug = url.searchParams.get('debug') === '1';
       if (!code) {
-        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346（加 &debug=1 查看原始字段）' }, 400);
+        return jsonResponse({ error: '请提供 code 参数，如 ?code=300346  (标准CapEx现金流科目)' }, 400);
       }
       try {
-        const data = await fetchCapexIndicators(code, count, debug);
+        const data = await fetchCapexCashflow(code, count);
         return jsonResponse(data);
       } catch (err) {
         return jsonResponse({ error: err.message, stack: err.stack }, 500);
@@ -706,7 +808,8 @@ export default {
           announcements: 'GET /announcements?code=300346&start=2026-01-01&end=2026-06-30  (调试用：公告列表)',
           orgid: 'GET /orgid?code=300346  (调试用：查询巨潮资讯orgId)',
           shareholders: 'GET /shareholders?code=300346&date=2026-03-31  (调试用：十大流通股东)',
-          capex: 'GET /capex?code=300346&debug=1  (调试用：CapEx相关财务指标，建议先用debug=1核对字段)',
+          capex: 'GET /capex?code=300346  (调试用：标准CapEx现金流科目，含rawSample原始字段)',
+          cip: 'GET /cip?code=300346  (调试用：在建工程趋势，含rawSample原始字段)',
         },
       });
     }
