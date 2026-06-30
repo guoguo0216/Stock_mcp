@@ -275,6 +275,23 @@ async function fetchCapexIndicators(code, count = 8, debug = false) {
   }));
 }
 
+// ---------- 工具函数：兼容字符串日期和数字时间戳两种格式，统一输出 YYYY-MM-DD ----------
+function formatFlexibleDate(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    // 字符串格式，如 "2026-04-15 00:00:00" 或 "2026-04-15"
+    return value.slice(0, 10);
+  }
+  if (typeof value === 'number') {
+    // 数字时间戳，可能是秒级或毫秒级
+    const ms = value < 1e12 ? value * 1000 : value;
+    const d = new Date(ms);
+    if (isNaN(d.getTime())) return null;
+    return d.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
 // ---------- 新浪财经：利润表关键科目（含扣非净利润，按中文科目名匹配，不依赖猜测英文字段名） ----------
 async function fetchDeductedNetProfit(code, count = 8) {
   const normalized = normalizeCode(code);
@@ -461,7 +478,7 @@ async function fetchInvestorQA(code, count = 30, keyword = '') {
   return rows.map((row) => ({
     questionId: row.indexId,
     question: row.mainContent,
-    questionTime: row.pubDate ? row.pubDate.slice(0, 10) : null,
+    questionTime: formatFlexibleDate(row.pubDate),
     asker: row.authorName || null,
     answer: row.attachedContent || null,
     answerer: row.attachedAuthor || null,
