@@ -604,6 +604,119 @@ async function fetchAnnouncements(code, startDate, endDate, keyword = '', pageSi
 }
 
 
+// ---------- Google Drive：Service Account 鉴权（原地更新文件用） ----------
+let _cachedDriveToken = null; // { token, expiresAt } 简单内存缓存，同一 isolate 内复用
+
+function base64url(input) {
+  let bytes;
+  if (typeof input === 'string') {
+    bytes = new TextEncoder().encode(input);
+  } else {
+    bytes = new Uint8Array(input);
+  }
+  let str = '';
+  for (const b of bytes) str += String.fromCharCode(b);
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function importDrivePrivateKey(pem) {
+  const normalized = pem.includes('\\n') ? pem.replace(/\\n/g, '\n') : pem;
+  const pemBody = normalized
+    .replace('-----BEGIN PRIVATE KEY-----', '')
+    .replace('-----END PRIVATE KEY-----', '')
+    .replace(/\s+/g, '');
+  const binaryDer = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey(
+    'pkcs8',
+    binaryDer.buffer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+}
+
+async function getDriveAccessToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  if (_cachedDriveToken && _cachedDriveToken.expiresAt > now + 60) {
+    return _cachedDriveToken.token;
+  }
+
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claim = {
+    iss: env.GOOGLE_SA_EMAIL,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  };
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claim))}`;
+  const key = await importDrivePrivateKey(env.GOOGLE_SA_PRIVATE_KEY);
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(signingInput)
+  );
+  const jwt = `${signingInput}.${base64url(signature)}`;
+
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`获取 Google access token 失败: ${resp.status} ${await resp.text()}`);
+  }
+  const data = await resp.json();
+  _cachedDriveToken = { token: data.access_token, expiresAt: now + data.expires_in };
+  return data.access_token;
+}
+
+// 可选白名单：只允许更新这些 fileId，防止误传导致覆盖错文件。留空数组 [] 表示不限制。
+const DRIVE_ALLOWED_FILE_IDS = [
+  // '你的fundamental_index表fileId',
+  // '你的observation_pool表fileId',
+];
+
+async function updateDriveFile(env, fileId, content, mimeType = 'text/plain') {
+  if (!fileId || !content) {
+    throw new Error('fileId 和 content 都是必填参数');
+  }
+  if (DRIVE_ALLOWED_FILE_IDS.length > 0 && !DRIVE_ALLOWED_FILE_IDS.includes(fileId)) {
+    throw new Error(`fileId ${fileId} 不在允许更新的白名单内`);
+  }
+
+  const accessToken = await getDriveAccessToken(env);
+  const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media`;
+  const resp = await fetch(uploadUrl, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': mimeType,
+    },
+    body: content,
+  });
+  if (!resp.ok) {
+    throw new Error(`Drive API 返回错误 ${resp.status}: ${await resp.text()}`);
+  }
+  const data = await resp.json();
+
+  // 补一次 metadata 请求拿 modifiedTime（media upload 响应默认不带）
+  let modifiedTime = null;
+  const metaResp = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,modifiedTime`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (metaResp.ok) {
+    const meta = await metaResp.json();
+    modifiedTime = meta.modifiedTime;
+  }
+
+  return { fileId: data.id, name: data.name, modifiedTime };
+}
+
 const TOOLS = [
   {
     name: 'get_realtime_quote',
@@ -768,10 +881,23 @@ const TOOLS = [
       required: ['code'],
     },
   },
+  {
+    name: 'update_drive_file',
+    description: '原地覆写指定 Google Drive 文件的内容（保留 fileId 与版本历史，不会新建文件），用于更新 fundamental index / observation pool 等表格或深度分析文档。需要预先把目标文件所在文件夹共享给 Service Account。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_id: { type: 'string', description: '要更新的 Google Drive 文件 ID' },
+        content: { type: 'string', description: '新的文本内容（UTF-8），会完整覆盖原文件' },
+        mime_type: { type: 'string', description: '内容的 MIME 类型，默认 text/plain（Markdown/CSV 等文本类内容也用这个）' },
+      },
+      required: ['file_id', 'content'],
+    },
+  },
 ];
 
 // ---------- MCP 协议处理 ----------
-async function handleMcpRequest(body) {
+async function handleMcpRequest(body, env) {
   const { method, params, id } = body;
 
   if (method === 'initialize') {
@@ -817,6 +943,8 @@ async function handleMcpRequest(body) {
         defaultStart.setMonth(defaultStart.getMonth() - 6);
         const startDate = args.start_date || defaultStart.toISOString().slice(0, 10);
         resultData = await fetchInstitutionSurvey(args.code, startDate, args.count || 30);
+      } else if (name === 'update_drive_file') {
+        resultData = await updateDriveFile(env, args.file_id, args.content, args.mime_type || 'text/plain');
       } else {
         throw new Error(`未知工具: ${name}`);
       }
@@ -844,7 +972,7 @@ async function handleMcpRequest(body) {
 
 // ---------- Worker 入口 ----------
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     // CORS 预检
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -1040,7 +1168,7 @@ export default {
     if (url.pathname === '/mcp' && request.method === 'POST') {
       try {
         const body = await request.json();
-        const result = await handleMcpRequest(body);
+        const result = await handleMcpRequest(body, env);
         return jsonResponse(result);
       } catch (err) {
         return jsonResponse({ error: err.message }, 500);
