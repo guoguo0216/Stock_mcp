@@ -18,9 +18,33 @@ function normalizeCode(code) {
   throw new Error(`无法识别的股票代码: ${code}`);
 }
 
+// ---------- 工具函数：把任意形式的 codes 输入归一化为数组 ----------
+// 兼容三种情况：真数组 / 逗号分隔字符串 / 数组的JSON字符串（防止上游MCP客户端序列化不一致）
+function normalizeCodesInput(codes) {
+  if (Array.isArray(codes)) return codes;
+  if (typeof codes === 'string') {
+    const trimmed = codes.trim();
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return parsed;
+      } catch (_) {
+        // 不是合法JSON，走逗号分隔兜底
+      }
+    }
+    return trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  if (codes && typeof codes === 'object') {
+    // 兜底：被序列化成了 {"0":"300346","1":"002428"} 这种类数组对象
+    return Object.values(codes);
+  }
+  throw new Error(`codes 参数格式无法识别: ${JSON.stringify(codes)}`);
+}
+
 // ---------- 新浪实时行情 ----------
 async function fetchSinaRealtime(codes) {
-  const list = codes.map(normalizeCode).join(',');
+  const normalized = normalizeCodesInput(codes);
+  const list = normalized.map(normalizeCode).join(',');
   const url = `https://hq.sinajs.cn/list=${list}`;
   const resp = await fetch(url, {
     headers: {
