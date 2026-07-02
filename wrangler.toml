@@ -1,4 +1,4 @@
-name = "a-share-stock-quote"
+name = "stock-mcp"
 main = "src/index.js"
 compatibility_date = "2026-06-30"
 
